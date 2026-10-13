@@ -8,7 +8,7 @@ services:
     environment:
       - TZ=Europe/Amsterdam
       - DAEMON_MODE=true
-      - SYNC_TIME=06:30
+      - SYNC_TIME=08:30
     volumes:
       # Mount .env so rotated refresh tokens are saved back to host
       - ./.env:/app/.env
