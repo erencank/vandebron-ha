@@ -85,9 +85,13 @@ uv run python src/sync.py --date 2026-10-08
 Once you have run the sync at least once:
 1. In Home Assistant, navigate to **Settings** $\rightarrow$ **Dashboards** $\rightarrow$ **Energy**.
 2. **For Electricity:**
-   - Under *Electricity Grid*, click **Add Consumption**.
-   - Select `sensor.vandebron_electricity_consumption`.
+   - Under *Electricity Grid*, click **Add Consumption** (or edit existing `sensor.vandebron_electricity_consumption`).
+   - Under *Cost tracking*, select **Use an entity tracking the total costs**.
+   - Select `sensor.vandebron_electricity_cost`.
+   *(Note: Do not select "Use a static price" because imported statistics have no live entity state, which causes HA to display €0.00).*
 3. **For Gas:**
-   - Under *Gas Consumption*, click **Add Gas Source**.
-   - Select `sensor.vandebron_gas_consumption`.
-4. Go to your **Energy** dashboard. Navigate to yesterday's date in the date picker to see the 24 hourly bars!
+   - Under *Gas Consumption*, click **Add Gas Source** (or edit existing `sensor.vandebron_gas_consumption`).
+   - Under *Cost tracking*, select **Use an entity tracking the total costs**.
+   - Select `sensor.vandebron_gas_cost`.
+4. Go to your **Energy** dashboard and navigate the date picker to see your consumption bars and monetary cost graphs!
+

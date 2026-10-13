@@ -35,11 +35,12 @@ class StatisticMetadata:
     statistic_id: str
     name: str
     unit_of_measurement: str
-    unit_class: str
+    unit_class: str | None = None
     has_mean: bool = False
     has_sum: bool = True
     mean_type: int = 0
     source: str = "recorder"
+
 
 
 class HomeAssistantClient:
@@ -66,26 +67,33 @@ class HomeAssistantClient:
                 f"Authentication failed: {auth_resp.get('message', 'Invalid token')}"
             )
 
-    async def get_latest_statistic_sum(self, statistic_id: str) -> float:
+    async def get_latest_statistic_sum(
+        self,
+        statistic_id: str,
+        before_time: datetime | None = None,
+    ) -> float:
         """
-        Retrieves the latest cumulative sum for the given statistic_id from Home Assistant.
-        Returns 0.0 if the statistic does not exist yet.
+        Retrieves the cumulative sum for the given statistic_id immediately before before_time.
+        If before_time is None, retrieves the latest sum across all periods.
+        Returns 0.0 if no statistics exist prior to before_time.
         """
         async with websockets.connect(self.ws_url) as ws:
             await self._authenticate(ws)
 
-            # Query statistics for the last 30 days to locate the last recorded sum
+            # Query statistics for the 30 days prior to before_time
             req_id = self._next_id()
-            thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-            payload = {
+            ref_time = before_time if before_time is not None else datetime.now(timezone.utc)
+            start_time = (ref_time - timedelta(days=30)).isoformat()
+            payload: dict[str, Any] = {
                 "id": req_id,
                 "type": "recorder/statistics_during_period",
-                "start_time": thirty_days_ago,
+                "start_time": start_time,
                 "statistic_ids": [statistic_id],
                 "period": "hour",
             }
+            if before_time is not None:
+                payload["end_time"] = before_time.isoformat()
 
-            # A more targeted query: fetch recent hours
             await ws.send(json.dumps(payload))
             response = json.loads(await ws.recv())
 
@@ -100,9 +108,16 @@ class HomeAssistantClient:
             if not series:
                 return 0.0
 
-            # Find the latest recorded sum in the returned series
+            if before_time is not None:
+                before_ts_ms = int(before_time.timestamp() * 1000)
+                valid_entries = [e for e in series if e.get("start", 0) < before_ts_ms]
+                if not valid_entries:
+                    return 0.0
+                return float(valid_entries[-1].get("sum", 0.0) or 0.0)
+
             last_entry = series[-1]
             return float(last_entry.get("sum", 0.0) or 0.0)
+
 
     @staticmethod
     def build_import_payload(
@@ -144,6 +159,50 @@ class HomeAssistantClient:
             "stats": stats,
         }
 
+    @staticmethod
+    def calculate_electricity_cost_records(
+        records: list[UsageRecord],
+        peak_rate: float,
+        off_peak_rate: float,
+    ) -> list[UsageRecord]:
+        """
+        Calculates hourly monetary cost records for electricity using dual peak / off-peak rates.
+        """
+        cost_records: list[UsageRecord] = []
+        for rec in records:
+            hourly_cost = round(
+                (rec.consumption_peak * peak_rate) + (rec.consumption_off_peak * off_peak_rate),
+                4,
+            )
+            cost_records.append(
+                UsageRecord(
+                    timestamp=rec.timestamp,
+                    consumption=hourly_cost,
+                    unit="EUR",
+                )
+            )
+        return cost_records
+
+    @staticmethod
+    def calculate_gas_cost_records(
+        records: list[UsageRecord],
+        gas_rate: float,
+    ) -> list[UsageRecord]:
+        """
+        Calculates hourly monetary cost records for gas using a fixed rate per m³.
+        """
+        cost_records: list[UsageRecord] = []
+        for rec in records:
+            hourly_cost = round(rec.consumption * gas_rate, 4)
+            cost_records.append(
+                UsageRecord(
+                    timestamp=rec.timestamp,
+                    consumption=hourly_cost,
+                    unit="EUR",
+                )
+            )
+        return cost_records
+
     async def import_statistics(
         self,
         metadata: StatisticMetadata,
@@ -159,8 +218,11 @@ class HomeAssistantClient:
             await self._authenticate(ws)
 
             if starting_sum is None:
-                # Query HA for existing sum before importing
-                starting_sum = await self.get_latest_statistic_sum(metadata.statistic_id)
+                # Query HA for existing sum immediately prior to the first record
+                starting_sum = await self.get_latest_statistic_sum(
+                    metadata.statistic_id,
+                    before_time=records[0].timestamp,
+                )
 
             req_id = self._next_id()
             payload = self.build_import_payload(req_id, metadata, records, starting_sum)

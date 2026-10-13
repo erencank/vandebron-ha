@@ -79,6 +79,31 @@ def load_settings(config_path: Path | None = None) -> tuple[dict, str | None, Pa
                     "HOMEASSISTANT_ELECTRICITY_STATISTIC_ID",
                     "sensor.vandebron_electricity_consumption",
                 ),
+                "electricity_cost_statistic_id": os.environ.get(
+                    "HOMEASSISTANT_ELECTRICITY_COST_STATISTIC_ID",
+                    "sensor.vandebron_electricity_cost",
+                ),
+                "gas_cost_statistic_id": os.environ.get(
+                    "HOMEASSISTANT_GAS_COST_STATISTIC_ID",
+                    "sensor.vandebron_gas_cost",
+                ),
+            },
+            "rates": {
+                "electricity_peak_rate": float(
+                    os.environ.get("ELECTRICITY_PEAK_RATE")
+                    or os.environ.get("ELECTRICITY_PRICE_EUR_PER_KWH")
+                    or 0.29002
+                ),
+                "electricity_off_peak_rate": float(
+                    os.environ.get("ELECTRICITY_OFF_PEAK_RATE")
+                    or os.environ.get("ELECTRICITY_PRICE_EUR_PER_KWH")
+                    or 0.24246
+                ),
+                "gas_rate": float(
+                    os.environ.get("GAS_RATE")
+                    or os.environ.get("GAS_PRICE_EUR_PER_M3")
+                    or 1.47196
+                ),
             },
         }
         return config, env_file, (config_path if config_path and config_path.exists() else None)
@@ -86,7 +111,14 @@ def load_settings(config_path: Path | None = None) -> tuple[dict, str | None, Pa
     # Fallback to config.json
     if config_path and config_path.exists():
         with open(config_path, "r", encoding="utf-8") as f:
-            return json.load(f), env_file, config_path
+            cfg = json.load(f)
+            if "rates" not in cfg:
+                cfg["rates"] = {
+                    "electricity_peak_rate": 0.29002,
+                    "electricity_off_peak_rate": 0.24246,
+                    "gas_rate": 1.47196,
+                }
+            return cfg, env_file, config_path
 
     logger.error("Configuration not found! Please provide a .env file or config.json.")
     logger.error("See .env.example or config.example.json for required variables.")
@@ -148,6 +180,7 @@ async def run_sync(
 
     vdb_cfg = config["vandebron"]
     ha_cfg = config["homeassistant"]
+    rates = config.get("rates", {})
 
     refresh_token = vdb_cfg.get("refresh_token")
     if not refresh_token:
@@ -201,11 +234,45 @@ async def run_sync(
             if dry_run:
                 payload = ha_client.build_import_payload(1, gas_meta, hourly_gas, starting_sum=0.0)
                 logger.info(
-                    "[DRY RUN] Gas Payload that would be sent to Home Assistant:\n%s",
+                    "[DRY RUN] Gas Consumption Payload that would be sent to Home Assistant:\n%s",
                     json.dumps(payload, indent=2),
                 )
             else:
                 await ha_client.import_statistics(gas_meta, hourly_gas)
+
+            # --- Gas Cost Synchronization ---
+            gas_rate = float(rates.get("gas_rate", 1.47196))
+            if gas_rate > 0.0:
+                hourly_gas_costs = ha_client.calculate_gas_cost_records(
+                    hourly_gas, gas_rate=gas_rate
+                )
+                total_gas_cost = sum(r.consumption for r in hourly_gas_costs)
+                logger.info(
+                    "Calculated Gas Cost for %d hours: €%.2f (@ €%.5f/m³)",
+                    len(hourly_gas_costs),
+                    total_gas_cost,
+                    gas_rate,
+                )
+
+                gas_cost_meta = StatisticMetadata(
+                    statistic_id=ha_cfg.get(
+                        "gas_cost_statistic_id", "sensor.vandebron_gas_cost"
+                    ),
+                    name="Vandebron Gas Cost",
+                    unit_of_measurement="EUR",
+                    unit_class=None,
+                )
+
+                if dry_run:
+                    payload = ha_client.build_import_payload(
+                        3, gas_cost_meta, hourly_gas_costs, starting_sum=0.0
+                    )
+                    logger.info(
+                        "[DRY RUN] Gas Cost Payload that would be sent to Home Assistant:\n%s",
+                        json.dumps(payload, indent=2),
+                    )
+                else:
+                    await ha_client.import_statistics(gas_cost_meta, hourly_gas_costs)
 
         except Exception as e:
             logger.error("Failed to sync Gas data: %s", e)
@@ -243,11 +310,52 @@ async def run_sync(
                     2, elec_meta, hourly_elec, starting_sum=0.0
                 )
                 logger.info(
-                    "[DRY RUN] Electricity Payload that would be sent to Home Assistant:\n%s",
+                    "[DRY RUN] Electricity Consumption Payload that would be sent to Home Assistant:\n%s",
                     json.dumps(payload, indent=2),
                 )
             else:
                 await ha_client.import_statistics(elec_meta, hourly_elec)
+
+            # --- Electricity Cost Synchronization (Dual-Tariff Peak / Off-Peak) ---
+            peak_rate = float(rates.get("electricity_peak_rate", 0.29002))
+            off_peak_rate = float(rates.get("electricity_off_peak_rate", 0.24246))
+
+            hourly_elec_costs = ha_client.calculate_electricity_cost_records(
+                hourly_elec, peak_rate=peak_rate, off_peak_rate=off_peak_rate
+            )
+            total_elec_cost = sum(r.consumption for r in hourly_elec_costs)
+            total_peak_kwh = sum(r.consumption_peak for r in hourly_elec)
+            total_off_peak_kwh = sum(r.consumption_off_peak for r in hourly_elec)
+
+            logger.info(
+                "Calculated Electricity Cost for %d hours: €%.2f (Peak: %.3f kWh @ €%.5f, Off-Peak: %.3f kWh @ €%.5f)",
+                len(hourly_elec_costs),
+                total_elec_cost,
+                total_peak_kwh,
+                peak_rate,
+                total_off_peak_kwh,
+                off_peak_rate,
+            )
+
+            elec_cost_meta = StatisticMetadata(
+                statistic_id=ha_cfg.get(
+                    "electricity_cost_statistic_id", "sensor.vandebron_electricity_cost"
+                ),
+                name="Vandebron Electricity Cost",
+                unit_of_measurement="EUR",
+                unit_class=None,
+            )
+
+            if dry_run:
+                payload = ha_client.build_import_payload(
+                    4, elec_cost_meta, hourly_elec_costs, starting_sum=0.0
+                )
+                logger.info(
+                    "[DRY RUN] Electricity Cost Payload that would be sent to Home Assistant:\n%s",
+                    json.dumps(payload, indent=2),
+                )
+            else:
+                await ha_client.import_statistics(elec_cost_meta, hourly_elec_costs)
 
         except Exception as e:
             logger.error("Failed to sync Electricity data: %s", e)

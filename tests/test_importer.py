@@ -163,7 +163,176 @@ class TestVandebronImporter(unittest.TestCase):
         self.assertAlmostEqual(records[1].consumption, 0.268)
 
 
+    def test_parse_vandebron_peak_offpeak(self) -> None:
+        """Tests parsing peak and off-peak electricity from Vandebron response."""
+        raw_api_response = {
+            "unit": "WH",
+            "resolution": "Hours",
+            "values": [
+                {
+                    "time": "2026-10-08T12:00:00Z",
+                    "consumption": 1000.0,
+                    "consumptionPeak": 1000.0,
+                    "consumptionOffPeak": 0.0,
+                    "production": 0.0,
+                },
+                {
+                    "time": "2026-10-08T02:00:00Z",
+                    "consumption": 500.0,
+                    "consumptionPeak": 0.0,
+                    "consumptionOffPeak": 500.0,
+                    "production": 0.0,
+                },
+            ],
+        }
+
+        unit_raw = (raw_api_response.get("unit") or "").upper()
+        scale = 0.001 if unit_raw in ("WH", "WHR") else 1.0
+        unit = "kWh"
+
+        records = [
+            UsageRecord(
+                timestamp=datetime.fromisoformat(item["time"].replace("Z", "+00:00")),
+                consumption=round(float(item["consumption"]) * scale, 4),
+                production=round(float(item.get("production", 0.0)) * scale, 4),
+                unit=unit,
+                consumption_peak=round(float(item.get("consumptionPeak", 0.0)) * scale, 4),
+                consumption_off_peak=round(float(item.get("consumptionOffPeak", 0.0)) * scale, 4),
+            )
+            for item in raw_api_response["values"]
+        ]
+
+        self.assertEqual(len(records), 2)
+        self.assertAlmostEqual(records[0].consumption_peak, 1.0)
+        self.assertAlmostEqual(records[0].consumption_off_peak, 0.0)
+        self.assertAlmostEqual(records[1].consumption_peak, 0.0)
+        self.assertAlmostEqual(records[1].consumption_off_peak, 0.5)
+
+    def test_is_off_peak_schedule(self) -> None:
+        """Tests the Dutch grid off-peak schedule logic."""
+        from vandebron_client import is_off_peak_time
+
+        # Thursday 2026-10-08 14:00 Amsterdam (12:00 UTC) -> Weekday Peak
+        dt_peak = datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc)
+        self.assertFalse(is_off_peak_time(dt_peak))
+
+        # Thursday 2026-10-08 04:00 Amsterdam (02:00 UTC) -> Weekday Off-peak
+        dt_night = datetime(2026, 10, 8, 2, 0, tzinfo=timezone.utc)
+        self.assertTrue(is_off_peak_time(dt_night))
+
+        # Thursday 2026-10-08 23:30 Amsterdam (21:30 UTC) -> Weekday Off-peak
+        dt_late = datetime(2026, 10, 8, 21, 30, tzinfo=timezone.utc)
+        self.assertTrue(is_off_peak_time(dt_late))
+
+        # Saturday 2026-10-10 14:00 Amsterdam (12:00 UTC) -> Weekend Off-peak
+        dt_weekend = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
+        self.assertTrue(is_off_peak_time(dt_weekend))
+
+    def test_calculate_electricity_cost_records(self) -> None:
+        """Tests dual peak / off-peak electricity cost calculation."""
+        records = [
+            UsageRecord(
+                timestamp=datetime(2026, 10, 8, 12, 0, tzinfo=timezone.utc),
+                consumption=2.0,
+                consumption_peak=2.0,
+                consumption_off_peak=0.0,
+                unit="kWh",
+            ),
+            UsageRecord(
+                timestamp=datetime(2026, 10, 8, 2, 0, tzinfo=timezone.utc),
+                consumption=3.0,
+                consumption_peak=0.0,
+                consumption_off_peak=3.0,
+                unit="kWh",
+            ),
+        ]
+
+        cost_records = HomeAssistantClient.calculate_electricity_cost_records(
+            records=records,
+            peak_rate=0.29002,
+            off_peak_rate=0.24246,
+        )
+
+        self.assertEqual(len(cost_records), 2)
+        self.assertEqual(cost_records[0].unit, "EUR")
+        # Hour 1: 2.0 kWh * 0.29002 = 0.58004 -> round to 4 decimals = 0.5800
+        self.assertAlmostEqual(cost_records[0].consumption, 0.5800, places=4)
+
+        # Hour 2: 3.0 kWh * 0.24246 = 0.72738 -> round to 4 decimals = 0.7274
+        self.assertAlmostEqual(cost_records[1].consumption, 0.7274, places=4)
+
+    def test_calculate_gas_cost_records(self) -> None:
+        """Tests gas cost calculation at fixed rate."""
+        records = [
+            UsageRecord(
+                timestamp=datetime(2026, 10, 8, 8, 0, tzinfo=timezone.utc),
+                consumption=0.5,
+                unit="m³",
+            ),
+            UsageRecord(
+                timestamp=datetime(2026, 10, 8, 9, 0, tzinfo=timezone.utc),
+                consumption=1.0,
+                unit="m³",
+            ),
+        ]
+
+        cost_records = HomeAssistantClient.calculate_gas_cost_records(
+            records=records,
+            gas_rate=1.47196,
+        )
+
+        self.assertEqual(len(cost_records), 2)
+        self.assertEqual(cost_records[0].unit, "EUR")
+        # 0.5 m³ * 1.47196 = 0.73598 -> 0.7360
+        self.assertAlmostEqual(cost_records[0].consumption, 0.7360, places=4)
+        # 1.0 m³ * 1.47196 = 1.47196 -> 1.4720
+        self.assertAlmostEqual(cost_records[1].consumption, 1.4720, places=4)
+
+    def test_ha_monetary_payload(self) -> None:
+        """Tests that monetary cost payload matches Home Assistant LTS format."""
+        cost_records = [
+            UsageRecord(
+                timestamp=datetime(2026, 10, 8, 0, 0, tzinfo=timezone.utc),
+                consumption=0.58,
+                unit="EUR",
+            ),
+            UsageRecord(
+                timestamp=datetime(2026, 10, 8, 1, 0, tzinfo=timezone.utc),
+                consumption=0.72,
+                unit="EUR",
+            ),
+        ]
+
+        meta = StatisticMetadata(
+            statistic_id="sensor.vandebron_electricity_cost",
+            name="Vandebron Electricity Cost",
+            unit_of_measurement="EUR",
+            unit_class=None,
+        )
+
+        payload = HomeAssistantClient.build_import_payload(
+            message_id=10,
+            metadata=meta,
+            records=cost_records,
+            starting_sum=10.0,
+        )
+
+        self.assertEqual(payload["metadata"]["statistic_id"], "sensor.vandebron_electricity_cost")
+        self.assertEqual(payload["metadata"]["unit_of_measurement"], "EUR")
+        self.assertIsNone(payload["metadata"]["unit_class"])
+        self.assertTrue(payload["metadata"]["has_sum"])
+        self.assertFalse(payload["metadata"]["has_mean"])
+
+        stats = payload["stats"]
+        self.assertEqual(len(stats), 2)
+        self.assertAlmostEqual(stats[0]["state"], 0.58)
+        self.assertAlmostEqual(stats[0]["sum"], 10.58)
+        self.assertAlmostEqual(stats[1]["state"], 0.72)
+        self.assertAlmostEqual(stats[1]["sum"], 11.30)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 

@@ -9,8 +9,28 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
+
+
+def is_off_peak_time(dt: datetime) -> bool:
+    """
+    Determines whether a timestamp falls in Dutch off-peak (dal) hours.
+    Off-peak is:
+    - Weekdays between 23:00 and 07:00 (i.e. hour >= 23 or hour < 7)
+    - Weekends: all 48 hours (Saturday=5, Sunday=6)
+    Evaluated in Europe/Amsterdam timezone.
+    """
+    amsterdam_tz = ZoneInfo("Europe/Amsterdam")
+    local_dt = (
+        dt.astimezone(amsterdam_tz)
+        if dt.tzinfo
+        else dt.replace(tzinfo=timezone.utc).astimezone(amsterdam_tz)
+    )
+    if local_dt.weekday() in (5, 6):
+        return True
+    return local_dt.hour < 7 or local_dt.hour >= 23
 
 
 @dataclass
@@ -19,6 +39,10 @@ class UsageRecord:
     consumption: float
     production: float = 0.0
     unit: str = "kWh"
+    consumption_peak: float = 0.0
+    consumption_off_peak: float = 0.0
+    production_peak: float = 0.0
+    production_off_peak: float = 0.0
 
 
 class VandebronClient:
@@ -118,9 +142,36 @@ class VandebronClient:
             dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
             consumption = round(float(item.get("consumption", 0.0) or 0.0) * scale, 4)
             production = round(float(item.get("production", 0.0) or 0.0) * scale, 4)
+            consumption_peak = round(float(item.get("consumptionPeak", 0.0) or 0.0) * scale, 4)
+            consumption_off_peak = round(
+                float(item.get("consumptionOffPeak", 0.0) or 0.0) * scale, 4
+            )
+            production_peak = round(float(item.get("productionPeak", 0.0) or 0.0) * scale, 4)
+            production_off_peak = round(
+                float(item.get("productionOffPeak", 0.0) or 0.0) * scale, 4
+            )
+
+            # Fallback if API did not differentiate peak/off-peak but consumption > 0 (for electricity)
+            if (
+                (consumption_peak + consumption_off_peak) == 0.0
+                and consumption > 0.0
+                and unit == "kWh"
+            ):
+                if is_off_peak_time(dt):
+                    consumption_off_peak = consumption
+                else:
+                    consumption_peak = consumption
+
             records.append(
                 UsageRecord(
-                    timestamp=dt, consumption=consumption, production=production, unit=unit
+                    timestamp=dt,
+                    consumption=consumption,
+                    production=production,
+                    unit=unit,
+                    consumption_peak=consumption_peak,
+                    consumption_off_peak=consumption_off_peak,
+                    production_peak=production_peak,
+                    production_off_peak=production_off_peak,
                 )
             )
 
@@ -168,9 +219,20 @@ class VandebronClient:
             # Round down to the hour (minute=0, second=0, microsecond=0)
             hour_dt = rec.timestamp.replace(minute=0, second=0, microsecond=0)
             if hour_dt not in hourly_map:
-                hourly_map[hour_dt] = {"consumption": 0.0, "production": 0.0}
+                hourly_map[hour_dt] = {
+                    "consumption": 0.0,
+                    "production": 0.0,
+                    "consumption_peak": 0.0,
+                    "consumption_off_peak": 0.0,
+                    "production_peak": 0.0,
+                    "production_off_peak": 0.0,
+                }
             hourly_map[hour_dt]["consumption"] += rec.consumption
             hourly_map[hour_dt]["production"] += rec.production
+            hourly_map[hour_dt]["consumption_peak"] += rec.consumption_peak
+            hourly_map[hour_dt]["consumption_off_peak"] += rec.consumption_off_peak
+            hourly_map[hour_dt]["production_peak"] += rec.production_peak
+            hourly_map[hour_dt]["production_off_peak"] += rec.production_off_peak
 
         sorted_hours = sorted(hourly_map.keys())
         return [
@@ -179,6 +241,11 @@ class VandebronClient:
                 consumption=round(hourly_map[h]["consumption"], 4),
                 production=round(hourly_map[h]["production"], 4),
                 unit=unit,
+                consumption_peak=round(hourly_map[h]["consumption_peak"], 4),
+                consumption_off_peak=round(hourly_map[h]["consumption_off_peak"], 4),
+                production_peak=round(hourly_map[h]["production_peak"], 4),
+                production_off_peak=round(hourly_map[h]["production_off_peak"], 4),
             )
             for h in sorted_hours
         ]
+
