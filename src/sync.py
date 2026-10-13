@@ -64,13 +64,21 @@ def load_settings(config_path: Path | None = None) -> tuple[dict, str | None, Pa
                 "consumer_id": os.environ.get("VANDEBRON_CONSUMER_ID", ""),
                 "consumer_uuid": os.environ.get("VANDEBRON_CONSUMER_UUID", ""),
                 "gas_connection_id": os.environ.get("VANDEBRON_GAS_CONNECTION_ID", ""),
-                "electricity_connection_id": os.environ.get("VANDEBRON_ELECTRICITY_CONNECTION_ID", ""),
+                "electricity_connection_id": os.environ.get(
+                    "VANDEBRON_ELECTRICITY_CONNECTION_ID", ""
+                ),
             },
             "homeassistant": {
-                "ws_url": os.environ.get("HOMEASSISTANT_WS_URL") or os.environ.get("HASS_WS_URL", "ws://homeassistant.local/api/websocket"),
+                "ws_url": os.environ.get("HOMEASSISTANT_WS_URL")
+                or os.environ.get("HASS_WS_URL", "ws://homeassistant.local/api/websocket"),
                 "access_token": ha_token,
-                "gas_statistic_id": os.environ.get("HOMEASSISTANT_GAS_STATISTIC_ID", "sensor.vandebron_gas_consumption"),
-                "electricity_statistic_id": os.environ.get("HOMEASSISTANT_ELECTRICITY_STATISTIC_ID", "sensor.vandebron_electricity_consumption"),
+                "gas_statistic_id": os.environ.get(
+                    "HOMEASSISTANT_GAS_STATISTIC_ID", "sensor.vandebron_gas_consumption"
+                ),
+                "electricity_statistic_id": os.environ.get(
+                    "HOMEASSISTANT_ELECTRICITY_STATISTIC_ID",
+                    "sensor.vandebron_electricity_consumption",
+                ),
             },
         }
         return config, env_file, (config_path if config_path and config_path.exists() else None)
@@ -85,6 +93,35 @@ def load_settings(config_path: Path | None = None) -> tuple[dict, str | None, Pa
     sys.exit(1)
 
 
+def update_env_file_inplace(env_file_path: str, key: str, value: str) -> None:
+    """Updates a key in a .env file in-place without triggering Docker mount point errors."""
+    path = Path(env_file_path)
+    if not path.exists():
+        path.write_text(f"{key}={value}\n", encoding="utf-8")
+        return
+
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    key_found = False
+    new_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and stripped.startswith(f"{key}="):
+            new_lines.append(f"{key}={value}\n")
+            key_found = True
+        else:
+            new_lines.append(line)
+
+    if not key_found:
+        if new_lines and not new_lines[-1].endswith("\n"):
+            new_lines.append("\n")
+        new_lines.append(f"{key}={value}\n")
+
+    # In-place write avoids inode replacement (fixes [Errno 16] Device or resource busy)
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+
 def persist_refresh_token(
     new_token: str,
     env_file: str | None,
@@ -94,7 +131,7 @@ def persist_refresh_token(
     """Updates the rotated refresh token in .env and/or config.json."""
     if env_file and Path(env_file).exists():
         logger.info("Persisting rotated refresh token to %s...", env_file)
-        set_key(env_file, "VANDEBRON_REFRESH_TOKEN", new_token)
+        update_env_file_inplace(env_file, "VANDEBRON_REFRESH_TOKEN", new_token)
     if config_path and config_path.exists():
         logger.info("Persisting rotated refresh token to %s...", config_path)
         config_dict["vandebron"]["refresh_token"] = new_token
@@ -250,7 +287,9 @@ async def run_daemon(
             logger.error("Initial startup sync failed: %s", e)
 
     target_hour, target_minute = map(int, run_time.split(":"))
-    logger.info("Daemon active. Will run daily at %02d:%02d local time.", target_hour, target_minute)
+    logger.info(
+        "Daemon active. Will run daily at %02d:%02d local time.", target_hour, target_minute
+    )
 
     while True:
         now = datetime.now()
@@ -276,13 +315,20 @@ async def run_daemon(
 def main() -> None:
     root_config = Path(__file__).resolve().parent.parent / "config.json"
     src_config = Path(__file__).resolve().parent / "config.json"
-    default_config = root_config if root_config.exists() else (src_config if src_config.exists() else None)
+    default_config = (
+        root_config if root_config.exists() else (src_config if src_config.exists() else None)
+    )
     yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
     parser = argparse.ArgumentParser(
         description="Sync Vandebron energy data to Home Assistant Energy Dashboard"
     )
-    parser.add_argument("--config", type=Path, default=default_config, help="Path to config.json (optional if using .env)")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=default_config,
+        help="Path to config.json (optional if using .env)",
+    )
     parser.add_argument(
         "--date",
         type=str,
