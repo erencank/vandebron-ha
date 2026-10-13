@@ -1,0 +1,15 @@
+[project]
+name = "vandebron-ha"
+version = "0.1.0"
+description = "Daily Vandebron energy & gas usage and cost importer for Home Assistant Energy Dashboard"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "websockets>=12.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.2.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]

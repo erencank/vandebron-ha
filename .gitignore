@@ -1,0 +1,18 @@
+# Secrets & environment
+.env
+*.env
+!*.example
+config.json
+
+# Python & virtual environment
+.venv/
+__pycache__/
+*.pyc
+*.log
+
+# Caches
+.pytest_cache/
+.mypy_cache/
+
+# Vscode
+.vscode

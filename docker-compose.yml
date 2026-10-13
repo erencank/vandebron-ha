@@ -1,0 +1,14 @@
+services:
+  vandebron-ha:
+    build: .
+    container_name: vandebron-ha
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Europe/Amsterdam
+      - DAEMON_MODE=true
+      - SYNC_TIME=06:30
+    volumes:
+      # Mount .env so rotated refresh tokens are saved back to host
+      - ./.env:/app/.env
