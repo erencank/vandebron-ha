@@ -42,6 +42,21 @@ def get_env_file_path() -> str | None:
     return None
 
 
+def generate_date_range(start_date: str, end_date: str) -> list[str]:
+    """Generates an ordered list of YYYY-MM-DD dates from start_date to end_date inclusive."""
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
+    if start_dt > end_dt:
+        raise ValueError(f"start_date ({start_date}) cannot be after end_date ({end_date})")
+
+    dates = []
+    curr = start_dt
+    while curr <= end_dt:
+        dates.append(curr.strftime("%Y-%m-%d"))
+        curr += timedelta(days=1)
+    return dates
+
+
 def load_settings(config_path: Path | None = None) -> tuple[dict, str | None, Path | None]:
     """
     Loads settings with the following priority:
@@ -51,7 +66,7 @@ def load_settings(config_path: Path | None = None) -> tuple[dict, str | None, Pa
     """
     env_file = get_env_file_path()
     if env_file:
-        load_dotenv(env_file)
+        load_dotenv(env_file, override=True)
 
     # Check if configured via environment variables
     vdb_token = os.environ.get("VANDEBRON_REFRESH_TOKEN")
@@ -160,7 +175,11 @@ def persist_refresh_token(
     config_path: Path | None,
     config_dict: dict,
 ) -> None:
-    """Updates the rotated refresh token in .env and/or config.json."""
+    """Updates the rotated refresh token in memory, .env, and/or config.json."""
+    os.environ["VANDEBRON_REFRESH_TOKEN"] = new_token
+    if "vandebron" in config_dict:
+        config_dict["vandebron"]["refresh_token"] = new_token
+
     if env_file and Path(env_file).exists():
         logger.info("Persisting rotated refresh token to %s...", env_file)
         update_env_file_inplace(env_file, "VANDEBRON_REFRESH_TOKEN", new_token)
@@ -171,35 +190,15 @@ def persist_refresh_token(
             json.dump(config_dict, f, indent=2)
 
 
-async def run_sync(
-    config_path: Path | None,
+async def sync_single_day(
+    vdb_client: VandebronClient,
+    ha_client: HomeAssistantClient,
+    vdb_cfg: dict,
+    ha_cfg: dict,
+    rates: dict,
     target_date: str,
     dry_run: bool = False,
 ) -> None:
-    config, env_file, actual_config_path = load_settings(config_path)
-
-    vdb_cfg = config["vandebron"]
-    ha_cfg = config["homeassistant"]
-    rates = config.get("rates", {})
-
-    refresh_token = vdb_cfg.get("refresh_token")
-    if not refresh_token:
-        logger.error("No refresh_token found in configuration!")
-        sys.exit(1)
-
-    vdb_client = VandebronClient(refresh_token=refresh_token)
-
-    # 1. Refresh Keycloak access token and persist new refresh token if rotated
-    logger.info("Authenticating with Vandebron Keycloak...")
-    vdb_client.refresh_access_token()
-    if vdb_client.refresh_token != refresh_token:
-        persist_refresh_token(vdb_client.refresh_token, env_file, actual_config_path, config)
-
-    ha_client = HomeAssistantClient(
-        ws_url=ha_cfg["ws_url"],
-        access_token=ha_cfg["access_token"],
-    )
-
     consumer_id = vdb_cfg["consumer_id"]
     consumer_uuid = vdb_cfg.get("consumer_uuid", "")
     gas_conn_id = vdb_cfg.get("gas_connection_id")
@@ -377,47 +376,142 @@ async def run_sync(
         except Exception as e:
             logger.debug("Could not fetch costs: %s", e)
 
+
+async def run_sync(
+    config_path: Path | None,
+    target_dates: list[str] | str,
+    dry_run: bool = False,
+) -> None:
+    if isinstance(target_dates, str):
+        dates = [target_dates]
+    else:
+        dates = sorted(target_dates)
+
+    config, env_file, actual_config_path = load_settings(config_path)
+
+    vdb_cfg = config["vandebron"]
+    ha_cfg = config["homeassistant"]
+    rates = config.get("rates", {})
+
+    refresh_token = vdb_cfg.get("refresh_token")
+    if not refresh_token:
+        logger.error("No refresh_token found in configuration!")
+        sys.exit(1)
+
+    vdb_client = VandebronClient(refresh_token=refresh_token)
+
+    # 1. Refresh Keycloak access token and persist new refresh token if rotated
+    logger.info("Authenticating with Vandebron Keycloak...")
+    vdb_client.refresh_access_token()
+    if vdb_client.refresh_token != refresh_token:
+        persist_refresh_token(vdb_client.refresh_token, env_file, actual_config_path, config)
+
+    ha_client = HomeAssistantClient(
+        ws_url=ha_cfg["ws_url"],
+        access_token=ha_cfg["access_token"],
+    )
+
+    total_days = len(dates)
+    for idx, target_date in enumerate(dates, start=1):
+        if total_days > 1:
+            logger.info("=== [%d/%d] Processing date: %s ===", idx, total_days, target_date)
+        try:
+            await sync_single_day(
+                vdb_client=vdb_client,
+                ha_client=ha_client,
+                vdb_cfg=vdb_cfg,
+                ha_cfg=ha_cfg,
+                rates=rates,
+                target_date=target_date,
+                dry_run=dry_run,
+            )
+        except Exception as e:
+            logger.error("Failed to sync date %s: %s", target_date, e)
+
+    # Persist token if rotated during any calls
+    if vdb_client.refresh_token != vdb_cfg.get("refresh_token"):
+        persist_refresh_token(vdb_client.refresh_token, env_file, actual_config_path, config)
+
     logger.info("Sync finished successfully.")
+
+
+async def token_keepalive_loop(config_path: Path | None, interval_hours: float = 4.0) -> None:
+    """Proactively refreshes Keycloak tokens periodically to prevent expiration."""
+    interval_seconds = interval_hours * 3600
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            logger.info("Running proactive token keep-alive refresh...")
+            config, env_file, actual_config_path = load_settings(config_path)
+            refresh_token = config["vandebron"].get("refresh_token")
+            if not refresh_token:
+                logger.warning("Keep-alive: No refresh token found.")
+                continue
+
+            vdb_client = VandebronClient(refresh_token=refresh_token)
+            vdb_client.refresh_access_token()
+            if vdb_client.refresh_token != refresh_token:
+                persist_refresh_token(vdb_client.refresh_token, env_file, actual_config_path, config)
+            logger.info("Proactive token keep-alive successful.")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("Proactive token keep-alive failed: %s", e)
 
 
 async def run_daemon(
     config_path: Path | None = None,
-    run_time: str = "06:30",
+    run_time: str = "08:30",
     run_on_start: bool = True,
+    keepalive_hours: float = 4.0,
 ) -> None:
-    """Runs sync on startup (optional) and then continuously every day at run_time."""
-    if run_on_start:
-        logger.info("Executing initial sync on daemon startup...")
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        try:
-            await run_sync(config_path, target_date=yesterday)
-        except Exception as e:
-            logger.error("Initial startup sync failed: %s", e)
-
-    target_hour, target_minute = map(int, run_time.split(":"))
-    logger.info(
-        "Daemon active. Will run daily at %02d:%02d local time.", target_hour, target_minute
+    """Runs sync on startup (optional) and continuously every day at run_time, with token keep-alive."""
+    keepalive_task = asyncio.create_task(
+        token_keepalive_loop(config_path, interval_hours=keepalive_hours)
     )
 
-    while True:
-        now = datetime.now()
-        target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        sleep_seconds = (target - now).total_seconds()
-        logger.info(
-            "Next sync scheduled at %s (sleeping for %.1f hours)...",
-            target.strftime("%Y-%m-%d %H:%M:%S"),
-            sleep_seconds / 3600,
-        )
-        await asyncio.sleep(sleep_seconds)
+    try:
+        if run_on_start:
+            logger.info("Executing initial sync on daemon startup...")
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            try:
+                await run_sync(config_path, target_dates=yesterday)
+            except Exception as e:
+                logger.error("Initial startup sync failed: %s", e)
 
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        logger.info("Waking up for scheduled sync for date: %s", yesterday)
+        target_hour, target_minute = map(int, run_time.split(":"))
+        logger.info(
+            "Daemon active. Will run daily at %02d:%02d local time (keep-alive every %.1fh).",
+            target_hour,
+            target_minute,
+            keepalive_hours,
+        )
+
+        while True:
+            now = datetime.now()
+            target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+            sleep_seconds = (target - now).total_seconds()
+            logger.info(
+                "Next sync scheduled at %s (sleeping for %.1f hours)...",
+                target.strftime("%Y-%m-%d %H:%M:%S"),
+                sleep_seconds / 3600,
+            )
+            await asyncio.sleep(sleep_seconds)
+
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            logger.info("Waking up for scheduled sync for date: %s", yesterday)
+            try:
+                await run_sync(config_path, target_dates=yesterday)
+            except Exception as e:
+                logger.error("Scheduled sync failed: %s", e)
+    finally:
+        keepalive_task.cancel()
         try:
-            await run_sync(config_path, target_date=yesterday)
-        except Exception as e:
-            logger.error("Scheduled sync failed: %s", e)
+            await keepalive_task
+        except asyncio.CancelledError:
+            pass
 
 
 def main() -> None:
@@ -440,8 +534,26 @@ def main() -> None:
     parser.add_argument(
         "--date",
         type=str,
-        default=yesterday,
+        default=None,
         help="Target date in YYYY-MM-DD format (default: yesterday)",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="Start date for backfill range in YYYY-MM-DD format",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="End date for backfill range in YYYY-MM-DD format (defaults to yesterday if start-date is given)",
+    )
+    parser.add_argument(
+        "--backfill-days",
+        type=int,
+        default=None,
+        help="Number of past days to backfill up to yesterday",
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="Print payloads without sending to Home Assistant"
@@ -455,8 +567,14 @@ def main() -> None:
     parser.add_argument(
         "--time",
         type=str,
-        default=os.environ.get("SYNC_TIME", "06:30"),
-        help="Daily execution time for daemon mode in HH:MM (default: 06:30)",
+        default=os.environ.get("SYNC_TIME", "08:30"),
+        help="Daily execution time for daemon mode in HH:MM (default: 08:30)",
+    )
+    parser.add_argument(
+        "--keepalive-hours",
+        type=float,
+        default=float(os.environ.get("TOKEN_KEEPALIVE_HOURS", "4.0")),
+        help="Interval in hours for proactive Keycloak token refresh in daemon mode (default: 4.0)",
     )
     parser.add_argument(
         "--no-initial-run",
@@ -470,16 +588,30 @@ def main() -> None:
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
+    if args.start_date:
+        end_date = args.end_date or yesterday
+        target_dates = generate_date_range(args.start_date, end_date)
+    elif args.backfill_days:
+        if args.backfill_days < 1:
+            parser.error("--backfill-days must be at least 1")
+        start_date = (datetime.now() - timedelta(days=args.backfill_days)).strftime("%Y-%m-%d")
+        target_dates = generate_date_range(start_date, yesterday)
+    elif args.date:
+        target_dates = [args.date]
+    else:
+        target_dates = [yesterday]
+
     if args.daemon:
         asyncio.run(
             run_daemon(
                 config_path=args.config,
                 run_time=args.time,
                 run_on_start=not args.no_initial_run,
+                keepalive_hours=args.keepalive_hours,
             )
         )
     else:
-        asyncio.run(run_sync(config_path=args.config, target_date=args.date, dry_run=args.dry_run))
+        asyncio.run(run_sync(config_path=args.config, target_dates=target_dates, dry_run=args.dry_run))
 
 
 if __name__ == "__main__":

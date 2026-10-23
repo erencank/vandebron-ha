@@ -330,6 +330,93 @@ class TestVandebronImporter(unittest.TestCase):
         self.assertAlmostEqual(stats[1]["state"], 0.72)
         self.assertAlmostEqual(stats[1]["sum"], 11.30)
 
+    def test_generate_date_range(self) -> None:
+        """Tests generating chronological lists of date strings."""
+        from sync import generate_date_range
+
+        dates = generate_date_range("2026-10-14", "2026-10-16")
+        self.assertEqual(dates, ["2026-10-14", "2026-10-15", "2026-10-16"])
+
+        single = generate_date_range("2026-10-14", "2026-10-14")
+        self.assertEqual(single, ["2026-10-14"])
+
+        with self.assertRaises(ValueError):
+            generate_date_range("2026-10-16", "2026-10-14")
+
+    def test_persist_refresh_token_updates_environ_and_file(self) -> None:
+        """Tests that persist_refresh_token updates in-memory os.environ, config dict, and file."""
+        import os
+        import tempfile
+        from sync import persist_refresh_token
+
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as f:
+            f.write("VANDEBRON_REFRESH_TOKEN=old_tok\nOTHER_VAR=123\n")
+            temp_path = f.name
+
+        try:
+            os.environ["VANDEBRON_REFRESH_TOKEN"] = "old_tok"
+            cfg = {"vandebron": {"refresh_token": "old_tok"}}
+
+            persist_refresh_token("new_tok_xyz", temp_path, None, cfg)
+
+            # In-memory os.environ must be updated
+            self.assertEqual(os.environ["VANDEBRON_REFRESH_TOKEN"], "new_tok_xyz")
+            # Config dictionary must be updated
+            self.assertEqual(cfg["vandebron"]["refresh_token"], "new_tok_xyz")
+            # File on disk must be updated
+            with open(temp_path, "r", encoding="utf-8") as rf:
+                content = rf.read()
+            self.assertIn("VANDEBRON_REFRESH_TOKEN=new_tok_xyz", content)
+            self.assertIn("OTHER_VAR=123", content)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def test_vandebron_client_http_error_handling(self) -> None:
+        """Tests that refresh_access_token includes Keycloak error response details in exception."""
+        from unittest.mock import MagicMock
+        import requests
+
+        client = VandebronClient(refresh_token="expired_token")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 400
+        mock_resp.text = '{"error":"invalid_grant","error_description":"Token is not active"}'
+        mock_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            "400 Client Error", response=mock_resp
+        )
+        client.session.post = MagicMock(return_value=mock_resp)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            client.refresh_access_token()
+
+        self.assertIn("HTTP 400", str(ctx.exception))
+        self.assertIn("invalid_grant", str(ctx.exception))
+        self.assertIn("Token is not active", str(ctx.exception))
+
+    def test_load_settings_override_stale_env(self) -> None:
+        """Tests that load_settings with override=True picks up changes from .env even if already set in os.environ."""
+        import os
+        import tempfile
+        from unittest.mock import patch
+        from sync import load_settings
+
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as f:
+            f.write("VANDEBRON_REFRESH_TOKEN=fresh_token\nHOMEASSISTANT_ACCESS_TOKEN=test_ha\n")
+            temp_env = f.name
+
+        try:
+            os.environ["VANDEBRON_REFRESH_TOKEN"] = "stale_startup_token"
+            os.environ["HOMEASSISTANT_ACCESS_TOKEN"] = "test_ha"
+
+            with patch("sync.get_env_file_path", return_value=temp_env):
+                cfg, _, _ = load_settings()
+
+            self.assertEqual(cfg["vandebron"]["refresh_token"], "fresh_token")
+            self.assertEqual(os.environ["VANDEBRON_REFRESH_TOKEN"], "fresh_token")
+        finally:
+            if os.path.exists(temp_env):
+                os.remove(temp_env)
+
 
 if __name__ == "__main__":
     unittest.main()

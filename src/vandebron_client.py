@@ -72,10 +72,16 @@ class VandebronClient:
             "refresh_token": self.refresh_token,
             "scope": "openid",
         }
-        response = self.session.post(self.AUTH_URL, data=payload, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+        try:
+            response = self.session.post(self.AUTH_URL, data=payload, timeout=30)
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as exc:
+            err_details = response.text if response is not None else ""
+            raise RuntimeError(
+                f"Vandebron Keycloak authentication failed (HTTP {response.status_code}): {err_details}"
+            ) from exc
 
+        data = response.json()
         self.access_token = data["access_token"]
         if "refresh_token" in data:
             self.refresh_token = data["refresh_token"]
